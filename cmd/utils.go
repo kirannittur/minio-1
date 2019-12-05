@@ -133,7 +133,8 @@ const (
 	// This is a divergence from S3 limit on purpose to support
 	// use cases where users are going to upload large files
 	// using 'curl' and presigned URL.
-	globalMaxObjectSize = 5 * humanize.TiByte
+	// globalMaxObjectSize = 5 * humanize.TiByte
+	globalMaxObjectSize = 2 * humanize.GiByte
 
 	// Minimum Part size for multipart upload is 5MiB
 	globalMinPartSize = 5 * humanize.MiByte
