@@ -231,6 +231,16 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 	// Initialize fs.json values.
 	fsMeta := newFSMetaV1()
 	fsMeta.Meta = opts.UserDefined
+	_, catalogicMeta := fsMeta.Meta["X-Amz-Meta-Custom-Multipart"]
+	if catalogicMeta {
+		fsMeta.Meta["partuuid"] = mustGetUUID()
+		tmpPartPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, uploadID+"."+fsMeta.Meta["partuuid"]+".multipart")
+		writer, err := os.OpenFile(tmpPartPath, os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			return "", err
+		}
+		writer.Close()
+	}
 
 	fsMetaBytes, err := json.Marshal(fsMeta)
 	if err != nil {
@@ -264,6 +274,76 @@ func (fs *FSObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, d
 	return partInfo, nil
 }
 
+func (fs *FSObjects) PutObjectPartSequential(ctx context.Context, bucket, object, uploadID string, partID int, r *PutObjReader, opts ObjectOptions) (pi PartInfo, e error) {
+	data := r.Reader
+	// Validate input data size and it can never be less than -1.
+	if data.Size() < -1 {
+		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		return pi, toObjectErr(errInvalidArgument)
+	}
+
+	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
+	// Just check if the uploadID exists to avoid copy if it doesn't.
+	_, err := fsStatFile(ctx, pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return pi, InvalidUploadID{UploadID: uploadID}
+		}
+		return pi, toObjectErr(err, bucket, object)
+	}
+
+	fsMetaBytes, err := ioutil.ReadFile(pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return pi, err
+	}
+
+	var fsMeta fsMetaV1
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
+		return pi, err
+	}
+
+	fsMeta.Meta["PartNumber"] = strconv.Itoa(partID)
+	bufSize := int64(readSizeV1)
+	if size := data.Size(); size > 0 && bufSize > size {
+		bufSize = size
+	}
+
+	tmpPartPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, uploadID+"."+fsMeta.Meta["partuuid"]+".multipart")
+	bytesWritten, err := fsModifyFile(ctx, tmpPartPath, data, true, fsMeta)
+	if err != nil {
+		fsRemoveFile(ctx, tmpPartPath)
+		return pi, toObjectErr(err, minioMetaTmpBucket, tmpPartPath)
+	}
+
+	// Should return IncompleteBody{} error when reader has fewer
+	// bytes than specified in request header.
+	if bytesWritten < data.Size() {
+		fsRemoveFile(ctx, tmpPartPath)
+		return pi, IncompleteBody{}
+	}
+
+	etag := r.MD5CurrentHexString()
+
+	if etag == "" {
+		etag = GenETag()
+	}
+
+	fi, err := fsStatFile(ctx, tmpPartPath)
+	if err != nil {
+		return pi, toObjectErr(err, minioMetaMultipartBucket, tmpPartPath)
+	}
+
+	return PartInfo{
+		PartNumber:   partID,
+		LastModified: fi.ModTime(),
+		ETag:         etag,
+		Size:         fi.Size(),
+		ActualSize:   data.ActualSize(),
+	}, nil
+}
+
 // PutObjectPart - reads incoming data until EOF for the part file on
 // an ongoing multipart transaction. Internally incoming data is
 // written to '.minio.sys/tmp' location and safely renamed to
@@ -293,6 +373,24 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 			return pi, InvalidUploadID{UploadID: uploadID}
 		}
 		return pi, toObjectErr(err, bucket, object)
+	}
+
+	fsMetaBytes, err := ioutil.ReadFile(pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return pi, err
+	}
+
+	var fsMeta fsMetaV1
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
+		return pi, err
+	}
+
+	_, catalogicMultipart := fsMeta.Meta["X-Amz-Meta-Custom-Multipart"]
+	if catalogicMultipart {
+		pi, err := fs.PutObjectPartSequential(ctx, bucket, object, uploadID, partID, r, opts)
+		return pi, err
 	}
 
 	bufSize := int64(readSizeV1)
@@ -482,6 +580,97 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 	return result, nil
 }
 
+func (fs *FSObjects) CompleteMultipartUploadSequential(ctx context.Context, bucket string, object string, uploadID string, parts []CompletePart, opts ObjectOptions) (oi ObjectInfo, e error) {
+
+	if err := checkCompleteMultipartArgs(ctx, bucket, object, fs); err != nil {
+		return oi, toObjectErr(err)
+	}
+
+	// Check if an object is present as one of the parent dir.
+	if fs.parentDirIsObject(ctx, bucket, pathutil.Dir(object)) {
+		return oi, toObjectErr(errFileParentIsFile, bucket, object)
+	}
+
+	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+		return oi, toObjectErr(err, bucket)
+	}
+
+	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
+
+	// Just check if the uploadID exists to avoid copy if it doesn't.
+	_, err := fsStatFile(ctx, pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return oi, InvalidUploadID{UploadID: uploadID}
+		}
+		return oi, toObjectErr(err, bucket, object)
+	}
+
+	fsMetaBytes, err := ioutil.ReadFile(pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return oi, err
+	}
+
+	var fsMeta fsMetaV1
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
+		return oi, err
+	}
+	catalogicMulitpartFile := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, uploadID+"."+fsMeta.Meta["partuuid"]+".multipart")
+
+	// Calculate s3 compatible md5sum for complete multipart.
+	s3MD5 := getCompleteMultipartMD5(parts)
+
+	// Save additional metadata.
+	if len(fsMeta.Meta) == 0 {
+		fsMeta.Meta = make(map[string]string)
+	}
+	fsMeta.Meta["etag"] = s3MD5
+	// Save consolidated actual size.
+	//fsMeta.Meta[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(objectActualSize, 10)
+
+	// Hold write lock on the object.
+	destLock := fs.NewNSLock(ctx, bucket, object)
+	if err = destLock.GetLock(globalObjectTimeout); err != nil {
+		return oi, err
+	}
+	defer destLock.Unlock()
+	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+	metaFile, err := fs.rwPool.Create(fsMetaPath)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return oi, toObjectErr(err, bucket, object)
+	}
+	defer metaFile.Close()
+
+	if _, err = fsMeta.WriteTo(metaFile); err != nil {
+		logger.LogIf(ctx, err)
+		return oi, toObjectErr(err, bucket, object)
+	}
+	// Deny if WORM is enabled
+	if retention, isWORMBucket := isWORMEnabled(bucket); isWORMBucket {
+		if fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object)); err == nil && retention.Retain(fi.ModTime()) {
+			return ObjectInfo{}, ObjectAlreadyExists{Bucket: bucket, Object: object}
+		}
+	}
+
+	err = fsRenameFile(ctx, catalogicMulitpartFile, pathJoin(fs.fsPath, bucket, object))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return oi, toObjectErr(err, bucket, object)
+	}
+	fsRemoveAll(ctx, uploadIDDir)
+	// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
+	fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
+	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	if err != nil {
+		return oi, toObjectErr(err, bucket, object)
+	}
+
+	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+}
+
 // CompleteMultipartUpload - completes an ongoing multipart
 // transaction after receiving all the parts indicated by the client.
 // Returns an md5sum calculated by concatenating all the individual
@@ -515,12 +704,29 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return oi, toObjectErr(err, bucket, object)
 	}
 
+	fsMetaBytes, err := ioutil.ReadFile(pathJoin(uploadIDDir, fs.metaJSONFile))
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return oi, err
+	}
+	var fsMeta fsMetaV1
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
+		return oi, err
+	}
+
+	_, catalogicMultipart := fsMeta.Meta["X-Amz-Meta-Custom-Multipart"]
+	if catalogicMultipart {
+		oi, err := fs.CompleteMultipartUploadSequential(ctx, bucket, object, uploadID, parts, opts)
+		return oi, err
+	}
+
 	// Calculate s3 compatible md5sum for complete multipart.
 	s3MD5 := getCompleteMultipartMD5(parts)
 
 	partSize := int64(-1) // Used later to ensure that all parts sizes are same.
 
-	fsMeta := fsMetaV1{}
+	fsMeta = fsMetaV1{}
 
 	// Allocate parts similar to incoming slice.
 	fsMeta.Parts = make([]ObjectPartInfo, len(parts))

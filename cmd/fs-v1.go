@@ -277,6 +277,16 @@ func (fs *FSObjects) statBucketDir(ctx context.Context, bucket string) (os.FileI
 	return st, nil
 }
 
+func parseForLinkpath(bucketName string) (string, string) {
+	parts := strings.Split(bucketName, "-linkpath-")
+
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+
+	return parts[0], parts[1]
+}
+
 // MakeBucketWithLocation - create a new bucket, returns if it
 // already exists.
 func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket, location string) error {
@@ -295,12 +305,21 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket, locatio
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
+	_, linkPath := parseForLinkpath(bucket)
 	bucketDir, err := fs.getBucketDir(ctx, bucket)
+
 	if err != nil {
 		return toObjectErr(err, bucket)
 	}
 
-	if err = fsMkdir(ctx, bucketDir); err != nil {
+	if len(linkPath) > 0 {
+		transformedPath := "/" + strings.ReplaceAll(linkPath, "-", "/")
+		err = fsMkln(ctx, bucketDir, transformedPath)
+	} else {
+		err = fsMkdir(ctx, bucketDir)
+	}
+
+	if err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -860,6 +879,89 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	return fs.putObject(ctx, bucket, object, r, opts)
 }
 
+func (fs *FSObjects) putObjectModify(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
+	data := r.Reader
+
+	// No metadata is set, allocate a new one.
+	meta := make(map[string]string)
+	for k, v := range opts.UserDefined {
+		meta[k] = v
+	}
+	var err error
+
+	// Validate if bucket name is valid and exists.
+	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket)
+	}
+
+	fsMeta := newFSMetaV1()
+	fsMeta.Meta = meta
+
+	// Validate input data size and it can never be less than zero.
+	if data.Size() < -1 {
+		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		return ObjectInfo{}, errInvalidArgument
+	}
+
+	var wlk *lock.LockedFile
+	if bucket != minioMetaBucket {
+		bucketMetaDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix)
+
+		fsMetaPath := pathJoin(bucketMetaDir, bucket, object, fs.metaJSONFile)
+		wlk, err = fs.rwPool.Create(fsMetaPath)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+		// This close will allow for locks to be synchronized on `fs.json`.
+		defer wlk.Close()
+		defer func() {
+			// Remove meta file when PutObject encounters any error
+			if retErr != nil {
+				tmpDir := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
+				fsRemoveMeta(ctx, bucketMetaDir, fsMetaPath, tmpDir)
+			}
+		}()
+	}
+
+	var bytesWritten int64
+	fsNSObjPath := pathJoin(fs.fsPath, bucket, object)
+	bytesWritten, err = fsModifyFile(ctx, fsNSObjPath, data, false, fsMeta)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+	fsMeta.Meta["etag"] = r.MD5CurrentHexString()
+
+	// Should return IncompleteBody{} error when reader has fewer
+	// bytes than specified in request header.
+	if bytesWritten < data.Size() {
+		return ObjectInfo{}, IncompleteBody{}
+	}
+
+	// Deny if WORM is enabled
+	if retention, isWORMBucket := isWORMEnabled(bucket); isWORMBucket {
+		if fi, err := fsStatFile(ctx, fsNSObjPath); err == nil && retention.Retain(fi.ModTime()) {
+			return ObjectInfo{}, ObjectAlreadyExists{Bucket: bucket, Object: object}
+		}
+	}
+
+	if bucket != minioMetaBucket {
+		// Write FS metadata after a successful namespace operation.
+		if _, err = fsMeta.WriteTo(wlk); err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+	}
+
+	// Stat the file to fetch timestamp, size.
+	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	// Success.
+	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+}
+
 // putObject - wrapper for PutObject
 func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
 	data := r.Reader
@@ -878,6 +980,10 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 
 	fsMeta := newFSMetaV1()
 	fsMeta.Meta = meta
+	_, catalogicOffset := fsMeta.Meta["X-Amz-Meta-Catalogic-Offsetcount"]
+	if catalogicOffset {
+		return fs.putObjectModify(ctx, bucket, object, r, opts)
+	}
 
 	// This is a special case with size as '0' and object ends
 	// with a slash separator, we treat it like a valid operation
