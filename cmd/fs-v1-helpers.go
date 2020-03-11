@@ -19,9 +19,12 @@ package cmd
 import (
 	"context"
 	"io"
+	"io/ioutil"
 	"os"
 	pathutil "path"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/lock"
@@ -100,6 +103,46 @@ func fsRemoveDir(ctx context.Context, dirPath string) (err error) {
 		}
 		logger.LogIf(ctx, err)
 		return err
+	}
+
+	return nil
+}
+
+func fsMkln(ctx context.Context, linkPath, dirPath string) (err error) {
+	if dirPath == "" || linkPath == "" {
+		logger.LogIf(ctx, errInvalidArgument)
+		return errInvalidArgument
+	}
+
+	if err = checkPathLength(dirPath); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	if err = checkPathLength(linkPath); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+
+	if err = os.Symlink(dirPath, linkPath); err != nil {
+		switch {
+		case os.IsExist(err):
+			return errVolumeExists
+		case os.IsPermission(err):
+			logger.LogIf(ctx, errDiskAccessDenied)
+			return errDiskAccessDenied
+		case isSysErrNotDir(err):
+			// File path cannot be verified since
+			// one of the parents is a file.
+			logger.LogIf(ctx, errDiskAccessDenied)
+			return errDiskAccessDenied
+		case isSysErrPathNotFound(err):
+			// Add specific case for windows.
+			logger.LogIf(ctx, errDiskAccessDenied)
+			return errDiskAccessDenied
+		default:
+			logger.LogIf(ctx, err)
+			return err
+		}
 	}
 
 	return nil
@@ -297,6 +340,114 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 	// Success.
 	return fr, st.Size(), nil
+}
+
+// Modifies a file used for appending the existing the file.
+func fsModifyFile(ctx context.Context, filePath string, reader io.Reader, appendFile bool, fsMeta fsMetaV1) (int64, error) {
+	if filePath == "" || reader == nil {
+		logger.LogIf(ctx, errInvalidArgument)
+		return 0, errInvalidArgument
+	}
+
+	if err := checkPathLength(filePath); err != nil {
+		logger.LogIf(ctx, err)
+		return 0, err
+	}
+
+	b, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return 0, err
+	}
+
+	var partSize int64 = 0
+	var partNumber int64 = 0
+	var multipart = false
+
+	partSizeStr, ok := fsMeta.Meta["X-Amz-Meta-Partsize"]
+	if ok {
+		multipart = true
+		partSize, err = strconv.ParseInt(partSizeStr, 10, 64)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return 0, err
+		}
+	}
+
+	partId, ok := fsMeta.Meta["PartNumber"]
+	if ok {
+		partNumber, err = strconv.ParseInt(partId, 10, 64)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return 0, err
+		}
+	}
+
+	var bytesWritten int64
+	var bytesW int
+	if appendFile {
+		//writer, err := lock.Open(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+		writer, err := lock.Open(filePath, os.O_WRONLY, 0666)
+		defer writer.Close()
+
+		/* if err = syscall.Flock(int(writer.Fd()), syscall.LOCK_EX); err != nil {
+			return 0, err
+		} */
+
+		if err != nil {
+			return 0, osErrToFSFileErr(err)
+		}
+		if multipart {
+			seekTo := ((partNumber - 1) * partSize)
+			writer.Seek(seekTo, 0)
+		}
+		bytesW, err = writer.Write(b)
+		if err != nil {
+			return 0, osErrToFSFileErr(err)
+		}
+		/* if err = syscall.Flock(int(writer.Fd()), syscall.LOCK_UN); err != nil {
+			return 0, err
+		}*/
+		bytesWritten = int64(bytesW)
+	} else {
+		writer, err := lock.Open(filePath, os.O_WRONLY, 0666)
+		if err != nil {
+			return 0, osErrToFSFileErr(err)
+		}
+		defer writer.Close()
+		offsetCountStr, catalogicOffsetCount := fsMeta.Meta["X-Amz-Meta-Catalogic-Offsetcount"]
+		if !catalogicOffsetCount {
+			return 0, errInvalidArgument
+		}
+		offsetCount, err := strconv.Atoi(offsetCountStr)
+		var bytesLength int64
+		bytesLength = 0
+		for i := 0; i <= offsetCount; i++ {
+			offsetKey := "X-Amz-Meta-Catalogic-Offset" + string(i)
+			offsetValues, ok := fsMeta.Meta[offsetKey]
+			if !ok {
+				return 0, errInvalidArgument
+			}
+			offsetTokens := strings.Split(offsetValues, ",")
+			for _, token := range offsetTokens {
+				kv := strings.Split(token, "-")
+				offset, err := strconv.ParseInt(kv[0], 10, 64)
+				if err != nil {
+					return 0, osErrToFSFileErr(err)
+				}
+				length, err := strconv.ParseInt(kv[1], 10, 64)
+				if err != nil {
+					return 0, osErrToFSFileErr(err)
+				}
+				bytesW, err = writer.WriteAt(b[bytesLength:bytesLength+length], offset)
+				if err != nil {
+					return 0, osErrToFSFileErr(err)
+				}
+				bytesLength = bytesLength + length
+				bytesWritten += int64(bytesW)
+			}
+		}
+	}
+	return bytesWritten, nil
 }
 
 // Creates a file and copies data from incoming reader. Staging buffer is used by io.CopyBuffer.
